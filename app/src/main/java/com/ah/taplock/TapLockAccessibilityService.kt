@@ -3,6 +3,7 @@ package com.ah.taplock
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
+import android.annotation.SuppressLint
 import android.app.KeyguardManager
 import android.content.Intent
 import android.content.SharedPreferences
@@ -28,6 +29,7 @@ import androidx.annotation.StringRes
 import androidx.core.content.edit
 import kotlin.math.abs
 
+@SuppressLint("AccessibilityPolicy")
 class TapLockAccessibilityService : AccessibilityService() {
 
     companion object {
