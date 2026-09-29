@@ -1,7 +1,10 @@
 *.iml
 .gradle
 /local.properties
-/.idea
+/.idea/*
+!/.idea/scopes/
+/.idea/scopes/*
+!/.idea/scopes/TapLock_project.xml
 .DS_Store
 /build
 /captures

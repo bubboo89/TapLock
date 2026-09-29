@@ -2,11 +2,6 @@ package com.ah.taplock.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-// Brand seed colors.
-val MidnightGreen = Color(0xFF1A535C)
-val CarolinaBlue = Color(0xFF73B3CE)
-val MountbattenPink = Color(0xFF946E83)
-
 // --- Light scheme roles ---
 // Primary is a darkened Carolina-blue so white button text stays high-contrast on a
 // light surface; the green brand tone moves to the secondary role.

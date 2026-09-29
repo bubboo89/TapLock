@@ -44,6 +44,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
+import kotlin.time.Duration.Companion.seconds
 
 @Composable
 fun SettingsSectionCard(
@@ -190,7 +191,7 @@ fun DoubleTapTestArea(timeoutMs: Int) {
 
     LaunchedEffect(showSuccess) {
         if (showSuccess) {
-            delay(1000)
+            delay(1.seconds)
             showSuccess = false
         }
     }

@@ -76,16 +76,18 @@ You don't have to trust our privacy claims - you can verify them yourself in the
 ## Building from Source
 
 1. Clone the repository:
-```bash
-git clone https://github.com/modelorona/TapLock.git
-```
+
+   ```bash
+   git clone https://github.com/modelorona/TapLock.git
+   ```
 
 2. Open the project in Android Studio Hedgehog or later
 
 3. Build the project:
-```bash
-./gradlew assembleDebug
-```
+
+   ```bash
+   ./gradlew assembleDebug
+   ```
 
 ## Privacy
 

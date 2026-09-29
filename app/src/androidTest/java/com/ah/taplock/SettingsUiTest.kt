@@ -3,7 +3,6 @@ package com.ah.taplock
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.compose.ui.semantics.SemanticsActions
-import androidx.compose.ui.test.assertIsNotSelected
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.assertIsSelected

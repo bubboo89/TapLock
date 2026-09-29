@@ -1493,8 +1493,7 @@ class TapLockAccessibilityService : AccessibilityService() {
                     (window.isActive || window.isFocused)
             }
             .mapNotNull { window -> window.root?.packageName?.toString() }
-            .mapNotNull { packageName -> TapLockAppRules.sanitizeTrackedPackage(this, packageName) }
-            .firstOrNull()
+            .firstNotNullOfOrNull { packageName -> TapLockAppRules.sanitizeTrackedPackage(this, packageName) }
         if (windowPackage != null) return windowPackage
 
         return TapLockAppRules.sanitizeTrackedPackage(this, eventPackage)
