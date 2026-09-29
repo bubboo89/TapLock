@@ -2,10 +2,12 @@ package com.ah.taplock
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.accessibilityservice.GestureDescription
 import android.app.KeyguardManager
 import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.BitmapFactory
+import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.hardware.display.DisplayManager
@@ -54,8 +56,16 @@ class TapLockAccessibilityService : AccessibilityService() {
     private val bottomLeftCornerDoubleTapDetector = DoubleTapDetector()
     private val bottomRightCornerDoubleTapDetector = DoubleTapDetector()
     private var prefListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
+    private var statusBarGestureInProgress = false
+    private var forwardingLockScreenSwipe = false
     private var isOnLockScreen = false
     private var currentForegroundPackage: String? = null
+    private val overlayStateHandler = Handler(Looper.getMainLooper())
+    private val refreshOverlayState = Runnable {
+        updateOverlayForLockScreen()
+        updateOverlayTouchability()
+        updateFloatingLockButtonLayout()
+    }
 
     private data class StatusBarOverlayFrame(
         val widthPx: Int,
@@ -69,10 +79,14 @@ class TapLockAccessibilityService : AccessibilityService() {
         instance = this
         currentForegroundPackage = TapLockAppRules.getForegroundPackage(this)
         serviceInfo?.let { info ->
-            info.flags = info.flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+            // SystemUI's scene containers are not always marked important for speech.
+            info.flags = info.flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+                AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
             info.eventTypes = info.eventTypes or
                 AccessibilityEvent.TYPE_WINDOWS_CHANGED or
-                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
             serviceInfo = info
         }
         updateOverlay()
@@ -82,6 +96,7 @@ class TapLockAccessibilityService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         instance = null
+        overlayStateHandler.removeCallbacks(refreshOverlayState)
         removeStatusBarOverlay()
         removeEdgeOverlays()
         removeCornerOverlays()
@@ -92,6 +107,7 @@ class TapLockAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         instance = null
+        overlayStateHandler.removeCallbacks(refreshOverlayState)
         removeStatusBarOverlay()
         removeEdgeOverlays()
         removeCornerOverlays()
@@ -121,6 +137,15 @@ class TapLockAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            if (event.packageName?.toString() == SYSTEM_UI_PACKAGE) {
+                // Scene animations produce many events, often before the new tree is
+                // ready. Inspect the settled tree without traversing every frame.
+                overlayStateHandler.removeCallbacks(refreshOverlayState)
+                overlayStateHandler.postDelayed(refreshOverlayState, 100)
+            }
+            return
+        }
 
         if (refreshForegroundPackage(event.packageName?.toString())) {
             updateOverlayTouchability()
@@ -130,10 +155,9 @@ class TapLockAccessibilityService : AccessibilityService() {
             event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
             event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
         ) {
-            updateInteractiveZoneOverlays()
-            updateOverlayTouchability()
-            updateOverlayForLockScreen()
-            updateFloatingLockButtonLayout()
+            refreshOverlayState.run()
+            overlayStateHandler.removeCallbacks(refreshOverlayState)
+            overlayStateHandler.postDelayed(refreshOverlayState, 100)
         }
     }
 
@@ -467,32 +491,44 @@ class TapLockAccessibilityService : AccessibilityService() {
         var downX = 0f
         var downY = 0f
         var swiped = false
+        var startedOnLockScreen = false
+        val swipePath = Path()
         val touchSlop = android.view.ViewConfiguration.get(this).scaledTouchSlop
 
         val overlay = View(this).apply {
             setOnTouchListener { v, event ->
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
+                        statusBarGestureInProgress = true
                         downTimeMs = System.currentTimeMillis()
                         downX = event.rawX
                         downY = event.rawY
                         swiped = false
+                        startedOnLockScreen = isOnLockScreen
+                        swipePath.reset()
+                        swipePath.moveTo(downX, downY)
                     }
                     MotionEvent.ACTION_MOVE -> {
+                        swipePath.lineTo(event.rawX, event.rawY)
                         if (!swiped) {
                             val dy = event.rawY - downY
-                            if (isOnLockScreen && dy < -touchSlop) {
-                                // Swipe up on lock screen — dismiss keyguard
+                            if (startedOnLockScreen &&
+                                (abs(dy) > touchSlop || abs(event.rawX - downX) > touchSlop)
+                            ) {
                                 swiped = true
-                                performGlobalAction(GLOBAL_ACTION_DISMISS_NOTIFICATION_SHADE)
-                            } else if (!isOnLockScreen && dy > touchSlop) {
+                                doubleTapDetector.reset()
+                            } else if (!startedOnLockScreen && dy > touchSlop) {
                                 swiped = true
                                 performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
                             }
                         }
                     }
                     MotionEvent.ACTION_UP -> {
-                        if (!swiped) {
+                        statusBarGestureInProgress = false
+                        if (swiped && startedOnLockScreen) {
+                            swipePath.lineTo(event.rawX, event.rawY)
+                            forwardLockScreenSwipe(Path(swipePath), event.eventTime - event.downTime)
+                        } else if (!swiped) {
                             if (isOnLockScreen) {
                                 handleLockScreenTap(downTimeMs, downX, downY)
                             } else if (isStatusBarVisible()) {
@@ -502,6 +538,12 @@ class TapLockAccessibilityService : AccessibilityService() {
                             }
                         }
                         v.performClick()
+                        updateStatusBarOverlayTouchability()
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        statusBarGestureInProgress = false
+                        doubleTapDetector.reset()
+                        updateStatusBarOverlayTouchability()
                     }
                 }
                 true
@@ -840,19 +882,23 @@ class TapLockAccessibilityService : AccessibilityService() {
     }
 
     private fun updateStatusBarOverlayTouchability() {
+        // SystemUI can expose its shade tree before the initiating drag has ended.
+        // Revoking our touch target then cancels the drag before it can open the shade.
+        if (statusBarGestureInProgress) return
         val overlay = statusBarOverlay ?: return
         val prefs = getPrefs()
         val statusBarEnabled = getZoneMode(prefs, R.string.status_bar_mode) != TapZoneMode.OFF
         val lockScreenEnabled = getZoneMode(prefs, R.string.lock_screen_mode) != TapZoneMode.OFF
         val appExcluded = isCurrentAppExcluded()
-        val notificationShadeExpanded = isNotificationShadeExpanded()
+        val systemUiPanelOpen = isSystemUiPanelOpen()
 
         // Disable touch when: in a fullscreen app (no status bar) and not on lock screen,
         // when the current app is excluded, or when only lock screen feature is enabled
         // and we're not on the lock screen. Also disable touch while the notification
-        // shade is expanded so System UI receives swipe-up gestures directly.
+        // shade or credential screen is open so SystemUI receives touches directly.
         val shouldDisableTouch = when {
-            notificationShadeExpanded -> true
+            forwardingLockScreenSwipe -> true
+            systemUiPanelOpen -> true
             isOnLockScreen && lockScreenEnabled -> false
             appExcluded -> true
             !isStatusBarVisible() -> true
@@ -875,7 +921,7 @@ class TapLockAccessibilityService : AccessibilityService() {
             Log.d(
                 TAG,
                 "overlay: touchDisabled=$shouldDisableTouch, " +
-                    "lockScreen=$isOnLockScreen, shade=$notificationShadeExpanded"
+                    "lockScreen=$isOnLockScreen, systemUiPanel=$systemUiPanelOpen"
             )
         }
     }
@@ -1064,7 +1110,9 @@ class TapLockAccessibilityService : AccessibilityService() {
         }
 
         // This node contains the point — is it clickable?
-        if (node.isClickable) {
+        // Structural nodes are included for SystemUI scene detection, but were
+        // previously hidden from this click search. Do not turn them into controls.
+        if (node.isClickable && node.isImportantForAccessibility) {
             return node
         }
         return null
@@ -1082,25 +1130,70 @@ class TapLockAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun isNotificationShadeExpanded(): Boolean {
-        return windows.any { window ->
-            if (window.type != AccessibilityWindowInfo.TYPE_SYSTEM) return@any false
-            val root = window.root ?: return@any false
-            if (root.packageName?.toString() != SYSTEM_UI_PACKAGE) return@any false
+    private fun isSystemUiPanelOpen(): Boolean {
+        val locked = isDeviceLocked()
+        var hasLockScreenContent = false
+        for (window in windows) {
+            if (window.type != AccessibilityWindowInfo.TYPE_SYSTEM) continue
+            val root = window.root ?: continue
+            if (root.packageName?.toString() != SYSTEM_UI_PACKAGE) continue
 
-            val className = root.className?.toString().orEmpty()
-            val title = window.title?.toString().orEmpty()
-            isNotificationShadeIdentifier(className) || isNotificationShadeIdentifier(title)
+            // SystemUI hosts keyguard, credentials and the shade in the same window.
+            // The empty lockscreen scene can remain behind the PIN keypad, so require
+            // visible lockscreen controls, not just the scene's container.
+            val visibleIds = mutableSetOf<String>()
+            collectVisibleSystemUiIds(root, visibleIds)
+            hasLockScreenContent = hasLockScreenContent || TapLockSystemUi.hasLockScreenContent(visibleIds)
+            if (TapLockSystemUi.isPanelOpen(
+                    keyguardLocked = locked,
+                    className = root.className?.toString().orEmpty(),
+                    title = window.title?.toString().orEmpty(),
+                    visibleIds = visibleIds
+                )
+            ) return true
+        }
+        // Accessibility trees can be temporarily unavailable during scene changes.
+        // Do not intercept credential entry while waiting for a confirmed lockscreen.
+        return locked && !hasLockScreenContent
+    }
+
+    private fun collectVisibleSystemUiIds(node: AccessibilityNodeInfo, ids: MutableSet<String>) {
+        if (node.isVisibleToUser) node.viewIdResourceName?.let(ids::add)
+        for (i in 0 until node.childCount) {
+            node.getChild(i)?.let { collectVisibleSystemUiIds(it, ids) }
         }
     }
 
-    private fun isNotificationShadeIdentifier(value: String): Boolean {
-        return value.contains("NotificationShade", ignoreCase = true) ||
-            value.contains("NotificationPanel", ignoreCase = true) ||
-            value.contains("QuickSettings", ignoreCase = true)
+    private fun forwardLockScreenSwipe(path: Path, durationMs: Long) {
+        val overlay = statusBarOverlay ?: return
+        forwardingLockScreenSwipe = true
+        updateStatusBarOverlayTouchability()
+        // Let WindowManager remove our touch target before replaying this user gesture.
+        overlay.postDelayed({
+            fun restoreTouchability() {
+                if (statusBarOverlay !== overlay) return
+                forwardingLockScreenSwipe = false
+                updateOverlayForLockScreen()
+                updateStatusBarOverlayTouchability()
+            }
+            if (statusBarOverlay !== overlay || !isDeviceLocked()) {
+                restoreTouchability()
+                return@postDelayed
+            }
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0, durationMs.coerceIn(1, 1000)))
+                .build()
+            val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription) = restoreTouchability()
+                override fun onCancelled(gestureDescription: GestureDescription) = restoreTouchability()
+            }, null)
+            if (!dispatched) restoreTouchability()
+        }, 50)
     }
 
     private fun removeStatusBarOverlay() {
+        statusBarGestureInProgress = false
+        forwardingLockScreenSwipe = false
         statusBarOverlay?.let {
             val wm = getSystemService(WINDOW_SERVICE) as WindowManager
             wm.removeView(it)
