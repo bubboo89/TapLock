@@ -42,6 +42,22 @@ android {
     }
 }
 
+// Export evaluated values, so CI never guesses or increments the release version.
+tasks.register("writeReleaseMetadata") {
+    val metadataFile = layout.buildDirectory.file("release-metadata.json")
+    val releaseName = android.defaultConfig.versionName
+    val releaseCode = android.defaultConfig.versionCode
+    val packageName = android.defaultConfig.applicationId
+    val sdk = android.compileSdk
+    doLast {
+        val output = metadataFile.get().asFile
+        output.parentFile.mkdirs()
+        output.writeText(
+            """{"versionName":"$releaseName","versionCode":$releaseCode,"packageName":"$packageName","compileSdk":$sdk}"""
+        )
+    }
+}
+
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

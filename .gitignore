@@ -19,3 +19,4 @@ fastlane/report.xml
 fastlane/metadata/android/screenshots.html
 fastlane/metadata/android/**/images/screenshots/
 .fdroid-submission
+/dist/

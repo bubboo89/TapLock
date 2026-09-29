@@ -1,0 +1,234 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: taplock-production-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ANDROID_BUILD_TOOLS: '37.0.0'
+
+jobs:
+  submit_play:
+    if: github.ref == 'refs/heads/main' && github.repository == 'modelorona/TapLock'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.version.outputs.name }}
+      version_code: ${{ steps.version.outputs.code }}
+      bundle_sha256: ${{ steps.sign.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Validate configuration and install Android SDK
+        env:
+          WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          PLAY_SERVICE_ACCOUNT: ${{ vars.PLAY_SERVICE_ACCOUNT }}
+          APP_CERT: ${{ vars.PLAY_APP_SIGNING_SHA256 }}
+          UPLOAD_CERT: ${{ vars.UPLOAD_CERTIFICATE_SHA256 }}
+        run: |
+          test -n "$WIF_PROVIDER" && test -n "$PLAY_SERVICE_ACCOUNT"
+          [[ "${APP_CERT//:/}" =~ ^[[:xdigit:]]{64}$ ]]
+          [[ "${UPLOAD_CERT//:/}" =~ ^[[:xdigit:]]{64}$ ]]
+          SDK=$(sed -nE 's/^[[:space:]]*compileSdk = ([0-9]+)$/\1/p' app/build.gradle.kts)
+          [[ "$SDK" =~ ^[0-9]+$ ]]
+          sdkmanager "platforms;android-$SDK" "build-tools;$ANDROID_BUILD_TOOLS"
+
+      - name: Read configured version and reject existing tags
+        id: version
+        run: |
+          ./gradlew --no-daemon :app:writeReleaseMetadata
+          VERSION=$(jq -er '.versionName | select(test("^[0-9]+(\\.[0-9]+){1,2}$"))' app/build/release-metadata.json)
+          CODE=$(jq -er '.versionCode | select(type == "number" and . > 0 and . <= 2100000000 and floor == .)' app/build/release-metadata.json)
+          jq -e '.packageName == "com.ah.taplock"' app/build/release-metadata.json
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            echo "Tag $VERSION already exists. Update versionName/versionCode in code."
+            exit 1
+          fi
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+
+      - name: Test, lint and build
+        run: ./gradlew --no-daemon testDebugUnitTest lint bundleRelease
+
+      - name: Sign AAB with upload key
+        id: sign
+        env:
+          KEYSTORE_BASE64: ${{ secrets.UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.UPLOAD_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.UPLOAD_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.UPLOAD_KEY_ALIAS }}
+          EXPECTED_CERT: ${{ vars.UPLOAD_CERTIFICATE_SHA256 }}
+          VERSION: ${{ steps.version.outputs.name }}
+        run: |
+          test -n "$KEYSTORE_BASE64" && test -n "$STORE_PASSWORD"
+          test -n "$KEY_PASSWORD" && test -n "$KEY_ALIAS"
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/upload.keystore"
+          ACTUAL=$(keytool -exportcert -keystore "$RUNNER_TEMP/upload.keystore" -storepass:env STORE_PASSWORD -alias "$KEY_ALIAS" | sha256sum | cut -d' ' -f1)
+          EXPECTED=$(printf '%s' "$EXPECTED_CERT" | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          test "$ACTUAL" = "$EXPECTED"
+          mkdir -p dist
+          jarsigner -keystore "$RUNNER_TEMP/upload.keystore" -storepass:env STORE_PASSWORD -keypass:env KEY_PASSWORD \
+            -signedjar "dist/TapLock-$VERSION.aab" app/build/outputs/bundle/release/app-release.aab "$KEY_ALIAS"
+          jarsigner -verify "dist/TapLock-$VERSION.aab"
+          echo "sha256=$(sha256sum "dist/TapLock-$VERSION.aab" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Attest AAB build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.aab
+
+      - name: Authenticate to Google Play using OIDC
+        id: google
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.PLAY_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+
+      - name: Submit full production release
+        uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
+        with:
+          serviceAccountJson: ${{ steps.google.outputs.credentials_file_path }}
+          packageName: com.ah.taplock
+          releaseFiles: dist/*.aab
+          releaseName: ${{ steps.version.outputs.name }}
+          track: production
+          status: completed
+          changesNotSentForReview: false
+          mappingFile: app/build/outputs/mapping/release/mapping.txt
+
+      - name: Remove temporary keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/upload.keystore"
+
+  github_release:
+    needs: submit_play
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.submit_play.outputs.version }}
+      VERSION_CODE: ${{ needs.submit_play.outputs.version_code }}
+      BUNDLE_SHA256: ${{ needs.submit_play.outputs.bundle_sha256 }}
+      PLAY_APP_SIGNING_SHA256: ${{ vars.PLAY_APP_SIGNING_SHA256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Check tag target and install APK verification tools
+        run: |
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            test "$(git rev-list -n 1 "$VERSION")" = "$GITHUB_SHA"
+          fi
+          sdkmanager "build-tools;$ANDROID_BUILD_TOOLS"
+
+      - name: Authenticate for APK download
+        id: google
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.PLAY_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/androidpublisher
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Download and verify Play-signed APK
+        env:
+          PLAY_ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
+        run: bash scripts/download-play-apk.sh
+
+      - name: Record Play distribution provenance
+        run: |
+          APK_SHA256=$(sha256sum "dist/TapLock-$VERSION.apk" | cut -d' ' -f1)
+          CERT=$(printf '%s' "$PLAY_APP_SIGNING_SHA256" | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          jq -n --arg version "$VERSION" --arg code "$VERSION_CODE" --arg sha "$GITHUB_SHA" \
+            --arg bundle "$BUNDLE_SHA256" --arg apk "$APK_SHA256" --arg cert "$CERT" \
+            --arg run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{versionName:$version,versionCode:$code,sourceCommit:$sha,bundleSha256:$bundle,apkSha256:$apk,
+              signingCertificateSha256:$cert,workflowRun:$run,generator:"Google Play",operation:"download-and-verify"}' \
+            > dist/play-predicate.json
+
+      - name: Attest Play APK distribution
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*.apk
+          predicate-type: https://github.com/modelorona/TapLock/attestations/play-distribution/v1
+          predicate-path: dist/play-predicate.json
+
+      - name: Prevent replacement of an already published APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          STATUS=$(curl --silent --show-error --fail-with-body -H "Authorization: Bearer $GH_TOKEN" \
+            -o "$RUNNER_TEMP/existing-release.json" -w '%{http_code}' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$VERSION") || test "$STATUS" = 404
+          if [[ "$STATUS" == 200 ]]; then
+            ASSET=$(jq -r --arg name "TapLock-$VERSION.apk" '.assets[] | select(.name == $name) | .id' "$RUNNER_TEMP/existing-release.json")
+            if [[ -n "$ASSET" ]]; then
+              gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$ASSET" > "$RUNNER_TEMP/existing.apk"
+              cmp "$RUNNER_TEMP/existing.apk" "dist/TapLock-$VERSION.apk"
+            fi
+          elif [[ "$STATUS" != 404 ]]; then
+            exit 1
+          fi
+
+      - name: Prepare verification assets
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          cp "$ATTESTATION_BUNDLE" dist/apk.sigstore.json
+          cd dist
+          sha256sum ./*.apk play-predicate.json apk.sigstore.json > SHA256SUMS
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.submit_play.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.submit_play.outputs.version }}
+          draft: false
+          prerelease: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            Submitted to Google Play production; availability is subject to Google's review and publishing settings.
+            The attached APK is generated and signed by Google Play. Its Sigstore attestation records download and verification by this workflow.
+          files: |
+            dist/*.apk
+            dist/play-predicate.json
+            dist/apk.sigstore.json
+            dist/SHA256SUMS
