@@ -2,6 +2,11 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      play_notes_en_us:
+        description: "Google Play What's new (English, up to 500 characters)"
+        required: true
+        type: string
 
 concurrency:
   group: taplock-production-release
@@ -32,6 +37,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Validate and prepare Google Play release notes
+        env:
+          PLAY_NOTES_EN_US: ${{ inputs.play_notes_en_us }}
+        run: |
+          mkdir -p dist/whatsnew
+          if [[ -z "${PLAY_NOTES_EN_US//[[:space:]]/}" ]]; then
+            echo "Google Play release notes are empty."
+            exit 1
+          fi
+          characters=$(printf '%s' "$PLAY_NOTES_EN_US" | LC_ALL=C.UTF-8 wc -m)
+          if (( characters > 500 )); then
+            echo "Google Play release notes exceed 500 characters."
+            exit 1
+          fi
+          printf '%s' "$PLAY_NOTES_EN_US" > dist/whatsnew/whatsnew-en-US
 
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
@@ -115,6 +136,7 @@ jobs:
           track: production
           status: completed
           changesNotSentForReview: false
+          whatsNewDirectory: dist/whatsnew
           mappingFile: app/build/outputs/mapping/release/mapping.txt
 
       - name: Remove temporary keystore

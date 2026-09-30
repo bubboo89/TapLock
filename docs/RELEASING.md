@@ -1,10 +1,12 @@
 # On-demand releases
 
 Update `versionName` and `versionCode` in `app/build.gradle.kts`, commit/push to
-`main`, then choose **Actions > Release > Run workflow > main**. There are no
-version inputs or increments: Gradle's configured name is the Git tag/release
-name, and the configured code is sent to Play unchanged. After manually releasing
-1.17, update both values for the next release before running this workflow.
+`main`, then choose **Actions > Release > Run workflow > main**. Enter short
+English Google Play "What's new" notes in the text field that appears. There
+are no version inputs or increments: Gradle's configured name is
+the Git tag/release name, and the configured code is sent to Play unchanged.
+After manually releasing 1.17, update both values for the next release before
+running this workflow.
 
 ## Workflow
 
@@ -21,6 +23,11 @@ No auto-increment, staged rollout, internal track, or manually approved GitHub
 release is required. Google review and account requirements still apply. Disable
 **Managed publishing** in Play Console if you want approved changes to go live
 without a separate publish click. GitHub can publish before the Play update is live.
+
+The required text field supplies Google Play's `en-US` "What's new" notes. It
+must be nonempty and at most 500 Unicode characters. The workflow checks it
+before building and submits it with the production release. GitHub's separately
+generated release notes are unaffected.
 
 Existing tags stop a fresh submission. Play rejects reused version codes. Runs are
 serialized. Actions are pinned to reviewed commit hashes.
